@@ -1,0 +1,96 @@
+name: MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - feature/*
+  pull_request:
+    branches:
+      - main
+      - staging
+
+env:
+  IMAGE_REPO: quay.io/your-org/mlops-pipeline
+  KIND_CLUSTER: mlops-cluster
+  KFP_ENDPOINT: http://kubeflow.example.com
+  MODEL_SERVICE_URL: http://model.example.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+
+      - name: Run Syntax Check and Linting
+        run: |
+          source venv/bin/activate
+          pylint dsl-convert.py || true
+
+      - name: Run Unit Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/
+
+      - name: Generate Kubeflow DSL Pipeline
+        run: |
+          source venv/bin/activate
+          python dsl-convert.py ml_model.py
+
+      - name: Build Docker Image
+        run: |
+          docker build -t $IMAGE_REPO:${{ github.ref_name }} .
+          docker tag $IMAGE_REPO:${{ github.ref_name }} $IMAGE_REPO:latest
+
+      - name: Push Image to Quay
+        run: |
+          echo "${{ secrets.QUAY_PASSWORD }}" | docker login quay.io -u ${{ secrets.QUAY_USERNAME }} --password-stdin
+          docker push $IMAGE_REPO:${{ github.ref_name }}
+          docker push $IMAGE_REPO:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kind cluster
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind create cluster --name $KIND_CLUSTER
+
+      - name: Apply KFP Pipeline YAML to Kind
+        run: |
+          kubectl apply -f ml_pipeline.yaml
+          kubectl wait --for=condition=available --timeout=300s deployment/mlops-pipeline
+
+      - name: Upload Pipeline to KFP
+        run: |
+          source venv/bin/activate
+          python upload_pipeline.py --pipeline ml_pipeline.yaml --endpoint $KFP_ENDPOINT
+
+      - name: Run Pipeline & Retrieve Metrics
+        run: |
+          source venv/bin/activate
+          python run_pipeline.py --pipeline ml_pipeline.yaml --endpoint $KFP_ENDPOINT --branch ${{ github.ref_name }}
+
+      - name: Deploy Model as a Service
+        run: |
+          kubectl apply -f model_service.yaml
+          echo "Model hosted at $MODEL_SERVICE_URL"
